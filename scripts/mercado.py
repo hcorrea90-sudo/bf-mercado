@@ -209,54 +209,78 @@ def scrape_chileautos_modelo(page, marca: str, modelo: str, ano: int) -> list[di
     url = f"{CA_BASE}/{marca_url}/{modelo_url}/{ano}-ano/"
 
     try:
-        resp = page.goto(url, wait_until="networkidle", timeout=30000)
+        resp = page.goto(url, wait_until="networkidle", timeout=40000)
         if not resp or resp.status >= 400:
-            return []
-        time.sleep(1.0)
+            # Intentar URL alternativa sin año
+            url2 = f"{CA_BASE}/{marca_url}/{modelo_url}/"
+            resp2 = page.goto(url2, wait_until="networkidle", timeout=30000)
+            if not resp2 or resp2.status >= 400:
+                return []
+        time.sleep(2.0)
     except Exception as e:
         log.debug(f"  CA error {marca} {modelo} {ano}: {e}")
         return []
 
-    # Extraer tarjetas via JS
-    datos = page.evaluate("""() => {
-        // Selectores posibles de Chileautos
-        const items = document.querySelectorAll(
-            '[data-webm-clickvalue="sv-item"], .listing-item, [class*="listing-item"], [class*="card--"]'
-        );
+    # Extraer via JS usando el patrón de precio CLP (clase-agnostic)
+    datos = page.evaluate("""(ano) => {
         const out = [];
-        items.forEach(t => {
-            const txt = t.innerText || '';
-            // Título: h2 o h3 con marca/modelo
-            let titulo = '';
-            for (const el of t.querySelectorAll('h2,h3,[class*="title"],[class*="heading"]')) {
-                const text = el.innerText.trim();
-                if (text.length > 5) { titulo = text; break; }
-            }
-            // Versión: línea debajo del título
-            let version = '';
-            for (const el of t.querySelectorAll('p,[class*="subtitle"],[class*="version"],[class*="trim"]')) {
-                const text = el.innerText.trim();
-                if (text.length > 3 && /\\d/.test(text) && !/^\\$/.test(text) && !/km$/i.test(text)) {
-                    version = text; break;
+
+        // Chileautos usa clases generadas — buscamos por contenido
+        // Estrategia: encontrar elementos con precio CLP y subir al contenedor
+        const allEls = document.querySelectorAll('*');
+        const precioEls = [...allEls].filter(el => {
+            if (el.children.length > 0) return false;
+            const txt = el.innerText || '';
+            return /\\$\\s*\\d{2,3}[.,]\\d{3}/.test(txt) && txt.length < 30;
+        });
+
+        const procesados = new Set();
+        precioEls.forEach(precioEl => {
+            // Subir 5-8 niveles para encontrar el contenedor de la tarjeta
+            let contenedor = precioEl;
+            for (let i = 0; i < 8; i++) {
+                if (!contenedor.parentElement) break;
+                contenedor = contenedor.parentElement;
+                const txt = contenedor.innerText || '';
+                // El contenedor correcto tiene título, precio y km
+                if (txt.includes('km') && txt.includes('$') && txt.length > 50 && txt.length < 600) {
+                    break;
                 }
             }
-            // Precio
-            let precio = '';
-            for (const el of t.querySelectorAll('[class*="price"],[class*="precio"],strong,b')) {
-                const text = el.innerText.trim();
-                if (/\\$[\\d\\.,\\s]{4,}/.test(text)) { precio = text; break; }
+
+            const key = contenedor.className + contenedor.innerText.slice(0, 50);
+            if (procesados.has(key)) return;
+            procesados.add(key);
+
+            const txt = contenedor.innerText || '';
+            if (!txt.includes('km') || !txt.includes('$')) return;
+
+            // Extraer líneas del texto
+            const lineas = txt.split('\\n').map(l => l.trim()).filter(l => l.length > 1);
+
+            // Título: línea con año y marca
+            let titulo = '', version = '', precio_txt = '', km_txt = '';
+            for (const linea of lineas) {
+                if (/^\\d{4}\\s+[A-Z]/.test(linea) && !titulo) {
+                    titulo = linea;
+                } else if (/\\d+\\.\\d+.*\\b(4[Xx][24]|2[Ww][Dd]|[Aa][Ww][Dd]|[Mm][Tt]|[Cc][Vv][Tt]|[Aa][Tt]|[Ss][Dd][Nn]|[Hh][Bb])/.test(linea) && !version) {
+                    version = linea;
+                } else if (/^\\$[\\d.,\\s]+/.test(linea) && !precio_txt) {
+                    precio_txt = linea;
+                } else if (/\\d{1,3}[.,]\\d{3}\\s*km/i.test(linea) && !km_txt) {
+                    km_txt = linea;
+                }
             }
-            if (!precio) {
-                const m = txt.match(/\\$[\\s]?[\\d\\.\\,]+/);
-                if (m) precio = m[0];
-            }
-            // Km
-            const km_m = txt.match(/(\\d{1,3}[.,]\\d{3})\\s*km/i);
-            const km = km_m ? km_m[1] : '';
-            out.push({ titulo, version, precio_txt: precio, km_txt: km, txt: txt.substring(0,300) });
+
+            // Filtrar por año
+            if (titulo && ano && !titulo.includes(String(ano))) return;
+            if (!precio_txt) return;
+
+            out.push({ titulo, version, precio_txt, km_txt, txt: txt.slice(0, 300) });
         });
+
         return out;
-    }""")
+    }""", ano)
 
     resultado = []
     for d in datos:
@@ -268,7 +292,6 @@ def scrape_chileautos_modelo(page, marca: str, modelo: str, ano: int) -> list[di
         if not precio:
             continue
 
-        # Construir título completo
         titulo_completo = f"{titulo} {ver}".strip() if ver and ver not in titulo else titulo
         titulo_completo = re.sub(r"\s+", " ", titulo_completo).strip()
 
